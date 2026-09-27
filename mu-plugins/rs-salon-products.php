@@ -2,25 +2,15 @@
 /**
  * Plugin Name: RS — товары удаляются вместе с салоном
  * Description: При перемещении салона в корзину его товары тоже уходят в корзину, при восстановлении салона — возвращаются, при окончательном удалении салона — удаляются навсегда. Большие салоны обрабатываются фоном через Action Scheduler (входит в WooCommerce).
- * Version: 1.0.0
+ * Version: 1.1.0
  *
- * Установка: положить файл в wp-content/mu-plugins/ (папку создать, если её нет).
- * Перед использованием проверьте две константы ниже: колонка «Товаров» в списке
- * салонов должна показывать реальное количество товаров каждого салона.
+ * Тип записи «Салоны» и поле ACF, связывающее товар с салоном, определяются
+ * автоматически. Что именно найдено — видно в уведомлении над списком салонов,
+ * а в колонке «Товаров» — сколько товаров у каждого салона. Пока поле не найдено,
+ * плагин ничего не удаляет.
  */
 
 defined( 'ABSPATH' ) || exit;
-
-// Slug типа записи «Салоны» (виден в адресе списка: edit.php?post_type=...).
-if ( ! defined( 'RS_SALON_POST_TYPE' ) ) {
-	define( 'RS_SALON_POST_TYPE', 'salon' );
-}
-
-// Имя поля (ACF) у товара, в котором хранится салон. Подходит поле типа
-// «Объект записи» и «Связь» — и одиночное, и множественное.
-if ( ! defined( 'RS_SALON_META_KEY' ) ) {
-	define( 'RS_SALON_META_KEY', 'salon' );
-}
 
 // Сколько товаров обрабатывать за один фоновый шаг.
 if ( ! defined( 'RS_SALON_BATCH' ) ) {
@@ -34,6 +24,74 @@ const RS_SALON_ACTION     = 'rs_salon_products_batch';
 const RS_SALON_GROUP      = 'rs-salon-products';
 
 /**
+ * Slug типа записи «Салоны». Можно задать вручную константой RS_SALON_POST_TYPE
+ * в wp-config.php, иначе ищется тип записи с названием «Салоны».
+ */
+function rs_salon_post_type() {
+	static $slug = null;
+
+	if ( null !== $slug ) {
+		return $slug;
+	}
+	if ( defined( 'RS_SALON_POST_TYPE' ) ) {
+		return $slug = RS_SALON_POST_TYPE;
+	}
+	if ( ! did_action( 'init' ) ) {
+		return '';
+	}
+
+	$slug = '';
+	foreach ( get_post_types( array(), 'objects' ) as $type ) {
+		if ( in_array( mb_strtolower( $type->label ), array( 'салоны', 'салон' ), true ) ) {
+			$slug = $type->name;
+			break;
+		}
+	}
+
+	return $slug;
+}
+
+/**
+ * Имена полей ACF, связывающих товар с салоном. Можно задать вручную константой
+ * RS_SALON_META_KEY, иначе берутся поля типа «Объект записи» / «Связь» у товара,
+ * которые ссылаются на тип «Салоны».
+ *
+ * @return string[]
+ */
+function rs_salon_meta_keys() {
+	static $keys = null;
+
+	if ( null !== $keys ) {
+		return $keys;
+	}
+	if ( defined( 'RS_SALON_META_KEY' ) ) {
+		return $keys = array( RS_SALON_META_KEY );
+	}
+
+	$keys = array();
+	$type = rs_salon_post_type();
+	if ( ! $type || ! function_exists( 'acf_get_field_groups' ) ) {
+		return $keys;
+	}
+
+	foreach ( acf_get_field_groups( array( 'post_type' => 'product' ) ) as $group ) {
+		foreach ( (array) acf_get_fields( $group ) as $field ) {
+			if ( in_array( $field['type'], array( 'post_object', 'relationship' ), true )
+				&& in_array( $type, (array) $field['post_type'], true ) ) {
+				$keys[] = $field['name'];
+			}
+		}
+	}
+
+	return $keys = array_values( array_unique( $keys ) );
+}
+
+function rs_salon_is_salon( $post_id ) {
+	$type = rs_salon_post_type();
+	return $type && get_post_type( $post_id ) === $type;
+}
+
+/**
  * ID товаров, привязанных к салону.
  *
  * @param int   $salon_id ID салона.
@@ -42,31 +100,36 @@ const RS_SALON_GROUP      = 'rs-salon-products';
  */
 function rs_salon_linked_product_ids( $salon_id, array $statuses ) {
 	$salon_id = (int) $salon_id;
+	$ids      = array();
 
-	$ids = get_posts(
-		array(
-			'post_type'        => 'product',
-			'post_status'      => $statuses,
-			'posts_per_page'   => -1,
-			'fields'           => 'ids',
-			'no_found_rows'    => true,
-			'suppress_filters' => true,
-			'meta_query'       => array(
-				'relation' => 'OR',
-				// «Объект записи», одиночный: значение = "123".
-				array(
-					'key'   => RS_SALON_META_KEY,
-					'value' => $salon_id,
-				),
-				// «Связь» / множественный объект: сериализованный массив с "123".
-				array(
-					'key'     => RS_SALON_META_KEY,
-					'value'   => '"' . $salon_id . '"',
-					'compare' => 'LIKE',
-				),
-			),
-		)
-	);
+	$meta_query = array( 'relation' => 'OR' );
+	foreach ( rs_salon_meta_keys() as $key ) {
+		// «Объект записи», одиночный: значение = "123".
+		$meta_query[] = array(
+			'key'   => $key,
+			'value' => $salon_id,
+		);
+		// «Связь» / множественный объект: сериализованный массив с "123".
+		$meta_query[] = array(
+			'key'     => $key,
+			'value'   => '"' . $salon_id . '"',
+			'compare' => 'LIKE',
+		);
+	}
+
+	if ( count( $meta_query ) > 1 ) {
+		$ids = get_posts(
+			array(
+				'post_type'        => 'product',
+				'post_status'      => $statuses,
+				'posts_per_page'   => -1,
+				'fields'           => 'ids',
+				'no_found_rows'    => true,
+				'suppress_filters' => true,
+				'meta_query'       => $meta_query,
+			)
+		);
+	}
 
 	/**
 	 * Позволяет подменить поиск, если связь салон → товары устроена иначе
@@ -82,12 +145,16 @@ function rs_salon_linked_product_ids( $salon_id, array $statuses ) {
  * Такие товары не трогаем.
  */
 function rs_salon_product_has_other_salon( $product_id, $salon_id ) {
-	$value  = maybe_unserialize( get_post_meta( $product_id, RS_SALON_META_KEY, true ) );
-	$others = array_diff( array_map( 'intval', (array) $value ), array( 0, (int) $salon_id ) );
+	$linked = array();
+	foreach ( rs_salon_meta_keys() as $key ) {
+		$value  = maybe_unserialize( get_post_meta( $product_id, $key, true ) );
+		$linked = array_merge( $linked, array_map( 'intval', (array) $value ) );
+	}
+	$others = array_diff( $linked, array( 0, (int) $salon_id ) );
 
 	foreach ( $others as $other_id ) {
 		$status = get_post_status( $other_id );
-		if ( $status && 'trash' !== $status && RS_SALON_POST_TYPE === get_post_type( $other_id ) ) {
+		if ( $status && 'trash' !== $status && rs_salon_is_salon( $other_id ) ) {
 			return true;
 		}
 	}
@@ -205,7 +272,7 @@ add_action(
 add_action(
 	'trashed_post',
 	function ( $post_id ) {
-		if ( RS_SALON_POST_TYPE !== get_post_type( $post_id ) ) {
+		if ( ! rs_salon_is_salon( $post_id ) ) {
 			return;
 		}
 		$ids = rs_salon_linked_product_ids( $post_id, array( 'publish', 'draft', 'pending', 'private', 'future' ) );
@@ -217,7 +284,7 @@ add_action(
 add_action(
 	'untrashed_post',
 	function ( $post_id ) {
-		if ( RS_SALON_POST_TYPE !== get_post_type( $post_id ) ) {
+		if ( ! rs_salon_is_salon( $post_id ) ) {
 			return;
 		}
 		$ids = get_posts(
@@ -240,7 +307,7 @@ add_action(
 add_action(
 	'before_delete_post',
 	function ( $post_id ) {
-		if ( RS_SALON_POST_TYPE !== get_post_type( $post_id ) ) {
+		if ( ! rs_salon_is_salon( $post_id ) ) {
 			return;
 		}
 		$statuses = array( 'publish', 'draft', 'pending', 'private', 'future', 'trash' );
@@ -265,26 +332,57 @@ add_action(
 );
 
 /*
- * Колонка «Товаров» в списке салонов — чтобы до первого удаления убедиться,
- * что RS_SALON_POST_TYPE и RS_SALON_META_KEY указаны верно.
+ * Колонка «Товаров» в списке салонов и уведомление о найденном поле — чтобы до
+ * первого удаления убедиться, что связь салон → товары определена верно.
  */
-add_filter(
-	'manage_' . RS_SALON_POST_TYPE . '_posts_columns',
-	function ( $columns ) {
-		$columns['rs_products'] = 'Товаров';
-		return $columns;
+add_action(
+	'admin_init',
+	function () {
+		$type = rs_salon_post_type();
+		if ( ! $type ) {
+			return;
+		}
+
+		add_filter(
+			'manage_' . $type . '_posts_columns',
+			function ( $columns ) {
+				$columns['rs_products'] = 'Товаров';
+				return $columns;
+			}
+		);
+
+		add_action(
+			'manage_' . $type . '_posts_custom_column',
+			function ( $column, $post_id ) {
+				if ( 'rs_products' === $column ) {
+					echo (int) count( rs_salon_linked_product_ids( $post_id, array( 'publish', 'draft', 'pending', 'private', 'future' ) ) );
+				}
+			},
+			10,
+			2
+		);
 	}
 );
 
 add_action(
-	'manage_' . RS_SALON_POST_TYPE . '_posts_custom_column',
-	function ( $column, $post_id ) {
-		if ( 'rs_products' === $column ) {
-			echo (int) count( rs_salon_linked_product_ids( $post_id, array( 'publish', 'draft', 'pending', 'private', 'future' ) ) );
+	'admin_notices',
+	function () {
+		$screen = get_current_screen();
+		if ( ! $screen || 'edit' !== $screen->base || $screen->post_type !== rs_salon_post_type() ) {
+			return;
 		}
-	},
-	10,
-	2
+
+		$keys = rs_salon_meta_keys();
+		if ( $keys ) {
+			printf(
+				'<div class="notice notice-info"><p>Удаление товаров вместе с салоном включено. Тип записи: <code>%s</code>, поле товара: <code>%s</code>.</p></div>',
+				esc_html( rs_salon_post_type() ),
+				esc_html( implode( ', ', $keys ) )
+			);
+		} else {
+			echo '<div class="notice notice-warning"><p>Не найдено поле ACF, связывающее товар с салоном — товары вместе с салоном удаляться не будут. Задайте константу RS_SALON_META_KEY в wp-config.php или в начале файла этого плагина.</p></div>';
+		}
+	}
 );
 
 /*
