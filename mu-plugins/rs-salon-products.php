@@ -2,7 +2,7 @@
 /**
  * Plugin Name: RS — товары удаляются вместе с салоном
  * Description: При перемещении салона в корзину его товары тоже уходят в корзину, при восстановлении салона — возвращаются, при окончательном удалении салона — удаляются навсегда. Большие салоны обрабатываются фоном через Action Scheduler (входит в WooCommerce).
- * Version: 1.1.0
+ * Version: 1.2.0
  *
  * Тип записи «Салоны» и поле ACF, связывающее товар с салоном, определяются
  * автоматически. Что именно найдено — видно в уведомлении над списком салонов,
@@ -25,7 +25,7 @@ const RS_SALON_GROUP      = 'rs-salon-products';
 
 /**
  * Slug типа записи «Салоны». Можно задать вручную константой RS_SALON_POST_TYPE
- * в wp-config.php, иначе ищется тип записи с названием «Салоны».
+ * в wp-config.php, иначе берётся rs_salon, а если его нет — тип с названием «Салоны».
  */
 function rs_salon_post_type() {
 	static $slug = null;
@@ -38,6 +38,11 @@ function rs_salon_post_type() {
 	}
 	if ( ! did_action( 'init' ) ) {
 		return '';
+	}
+
+	// На сайте салоны — тип rs_salon (видно в логах удаления).
+	if ( post_type_exists( 'rs_salon' ) ) {
+		return $slug = 'rs_salon';
 	}
 
 	$slug = '';
@@ -379,9 +384,107 @@ add_action(
 				esc_html( rs_salon_post_type() ),
 				esc_html( implode( ', ', $keys ) )
 			);
+			rs_salon_orphans_notice();
 		} else {
 			echo '<div class="notice notice-warning"><p>Не найдено поле ACF, связывающее товар с салоном — товары вместе с салоном удаляться не будут. Задайте константу RS_SALON_META_KEY в wp-config.php или в начале файла этого плагина.</p></div>';
 		}
+	}
+);
+
+/*
+ * Товары салонов, удалённых до установки плагина: салона уже нет (или он
+ * в корзине), а товары остались в каталоге. Над списком салонов показывается
+ * их количество и кнопка «Переместить в корзину».
+ */
+
+/**
+ * @return int[] ID товаров, у которых все указанные салоны удалены или в корзине.
+ */
+function rs_salon_orphan_product_ids() {
+	global $wpdb;
+
+	$keys = rs_salon_meta_keys();
+	if ( ! $keys ) {
+		return array();
+	}
+
+	$placeholders = implode( ',', array_fill( 0, count( $keys ), '%s' ) );
+	// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- плейсхолдеры собраны выше.
+	$rows = $wpdb->get_results( $wpdb->prepare( "SELECT pm.post_id, pm.meta_value FROM {$wpdb->postmeta} pm INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id WHERE p.post_type = 'product' AND p.post_status NOT IN ('trash', 'auto-draft', 'inherit') AND pm.meta_key IN ($placeholders) AND pm.meta_value <> ''", $keys ) );
+
+	$salons = array();
+	foreach ( $rows as $row ) {
+		$ids = array_filter( array_map( 'intval', (array) maybe_unserialize( $row->meta_value ) ) );
+		if ( $ids ) {
+			$product_id            = (int) $row->post_id;
+			$salons[ $product_id ] = array_merge( isset( $salons[ $product_id ] ) ? $salons[ $product_id ] : array(), $ids );
+		}
+	}
+
+	$alive   = array();
+	$orphans = array();
+	foreach ( $salons as $product_id => $ids ) {
+		$has_alive = false;
+		foreach ( $ids as $salon_id ) {
+			if ( ! isset( $alive[ $salon_id ] ) ) {
+				$status             = get_post_status( $salon_id );
+				$alive[ $salon_id ] = $status && 'trash' !== $status && rs_salon_is_salon( $salon_id );
+			}
+			if ( $alive[ $salon_id ] ) {
+				$has_alive = true;
+				break;
+			}
+		}
+		if ( ! $has_alive ) {
+			$orphans[] = $product_id;
+		}
+	}
+
+	return $orphans;
+}
+
+function rs_salon_orphans_notice() {
+	if ( ! current_user_can( 'manage_woocommerce' ) ) {
+		return;
+	}
+
+	$ids = rs_salon_orphan_product_ids();
+	if ( ! $ids ) {
+		return;
+	}
+
+	$links = array();
+	foreach ( array_slice( $ids, 0, 10 ) as $id ) {
+		$links[] = sprintf( '<a href="%s">%s</a>', esc_url( get_edit_post_link( $id ) ), esc_html( get_the_title( $id ) ) );
+	}
+
+	printf(
+		'<div class="notice notice-warning"><p>Товаров, у которых салон уже удалён или в корзине: <strong>%d</strong>. Например: %s%s</p>'
+		. '<form method="post" action="%s" style="margin:0 0 8px"><input type="hidden" name="action" value="rs_salon_trash_orphans">%s'
+		. '<button class="button" onclick="return confirm(\'Переместить эти товары в корзину? Их можно будет восстановить из корзины товаров.\')">Переместить в корзину</button></form></div>',
+		count( $ids ),
+		implode( ', ', $links ), // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- экранировано выше.
+		count( $ids ) > 10 ? '…' : '',
+		esc_url( admin_url( 'admin-post.php' ) ),
+		wp_nonce_field( 'rs_salon_trash_orphans', '_wpnonce', true, false ) // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+	);
+}
+
+add_action(
+	'admin_post_rs_salon_trash_orphans',
+	function () {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( 'Недостаточно прав.', 403 );
+		}
+		check_admin_referer( 'rs_salon_trash_orphans' );
+
+		$ids = rs_salon_orphan_product_ids();
+		rs_salon_notice( sprintf( 'Товаров удалённых салонов перемещено в корзину: %d.', count( $ids ) ) );
+		// Салон 0 — «уборка после старых удалений»; такие товары восстанавливаются вручную из корзины.
+		rs_salon_dispatch( 'trash', 0, $ids );
+
+		wp_safe_redirect( admin_url( 'edit.php?post_type=' . rs_salon_post_type() ) );
+		exit;
 	}
 );
 
