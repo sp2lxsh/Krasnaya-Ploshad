@@ -398,9 +398,12 @@ add_action(
  */
 
 /**
- * @return int[] ID товаров, у которых все указанные салоны удалены или в корзине.
+ * Товары, у которых все указанные салоны удалены или в корзине.
+ *
+ * @return int[] product_id => ID салона из корзины (чтобы товар вернулся при его
+ *               восстановлении) или 0, если салона уже нет совсем.
  */
-function rs_salon_orphan_product_ids() {
+function rs_salon_orphan_products() {
 	global $wpdb;
 
 	$keys = rs_salon_meta_keys();
@@ -421,23 +424,23 @@ function rs_salon_orphan_product_ids() {
 		}
 	}
 
-	$alive   = array();
+	$state   = array(); // salon_id => alive | trash | gone.
 	$orphans = array();
 	foreach ( $salons as $product_id => $ids ) {
-		$has_alive = false;
+		$owner = 0;
 		foreach ( $ids as $salon_id ) {
-			if ( ! isset( $alive[ $salon_id ] ) ) {
-				$status             = get_post_status( $salon_id );
-				$alive[ $salon_id ] = $status && 'trash' !== $status && rs_salon_is_salon( $salon_id );
+			if ( ! isset( $state[ $salon_id ] ) ) {
+				$status = rs_salon_is_salon( $salon_id ) ? get_post_status( $salon_id ) : false;
+				$state[ $salon_id ] = ! $status ? 'gone' : ( 'trash' === $status ? 'trash' : 'alive' );
 			}
-			if ( $alive[ $salon_id ] ) {
-				$has_alive = true;
-				break;
+			if ( 'alive' === $state[ $salon_id ] ) {
+				continue 2;
+			}
+			if ( 'trash' === $state[ $salon_id ] && ! $owner ) {
+				$owner = $salon_id;
 			}
 		}
-		if ( ! $has_alive ) {
-			$orphans[] = $product_id;
-		}
+		$orphans[ $product_id ] = $owner;
 	}
 
 	return $orphans;
@@ -448,23 +451,31 @@ function rs_salon_orphans_notice() {
 		return;
 	}
 
-	$ids = rs_salon_orphan_product_ids();
-	if ( ! $ids ) {
+	$orphans = rs_salon_orphan_products();
+	if ( ! $orphans ) {
 		return;
 	}
 
+	$groups = array();
+	foreach ( array_count_values( $orphans ) as $salon_id => $count ) {
+		$groups[] = $salon_id
+			? sprintf( 'салон «%s» в корзине — %d', esc_html( get_the_title( $salon_id ) ), $count )
+			: sprintf( 'салон удалён совсем — %d', $count );
+	}
+
 	$links = array();
-	foreach ( array_slice( $ids, 0, 10 ) as $id ) {
+	foreach ( array_slice( array_keys( $orphans ), 0, 10 ) as $id ) {
 		$links[] = sprintf( '<a href="%s">%s</a>', esc_url( get_edit_post_link( $id ) ), esc_html( get_the_title( $id ) ) );
 	}
 
 	printf(
-		'<div class="notice notice-warning"><p>Товаров, у которых салон уже удалён или в корзине: <strong>%d</strong>. Например: %s%s</p>'
+		'<div class="notice notice-warning"><p>Товаров, у которых салон уже удалён или в корзине: <strong>%d</strong> (%s).</p><p>Например: %s%s</p>'
 		. '<form method="post" action="%s" style="margin:0 0 8px"><input type="hidden" name="action" value="rs_salon_trash_orphans">%s'
-		. '<button class="button" onclick="return confirm(\'Переместить эти товары в корзину? Их можно будет восстановить из корзины товаров.\')">Переместить в корзину</button></form></div>',
-		count( $ids ),
+		. '<button class="button" onclick="return confirm(\'Переместить эти товары в корзину? Товары салонов из корзины вернутся при восстановлении салона, остальные можно восстановить из корзины товаров.\')">Переместить в корзину</button></form></div>',
+		count( $orphans ),
+		implode( '; ', $groups ), // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- экранировано выше.
 		implode( ', ', $links ), // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- экранировано выше.
-		count( $ids ) > 10 ? '…' : '',
+		count( $orphans ) > 10 ? '…' : '',
 		esc_url( admin_url( 'admin-post.php' ) ),
 		wp_nonce_field( 'rs_salon_trash_orphans', '_wpnonce', true, false ) // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 	);
@@ -478,10 +489,18 @@ add_action(
 		}
 		check_admin_referer( 'rs_salon_trash_orphans' );
 
-		$ids = rs_salon_orphan_product_ids();
-		rs_salon_notice( sprintf( 'Товаров удалённых салонов перемещено в корзину: %d.', count( $ids ) ) );
-		// Салон 0 — «уборка после старых удалений»; такие товары восстанавливаются вручную из корзины.
-		rs_salon_dispatch( 'trash', 0, $ids );
+		$orphans = rs_salon_orphan_products();
+		$by_salon = array();
+		foreach ( $orphans as $product_id => $salon_id ) {
+			$by_salon[ $salon_id ][] = $product_id;
+		}
+
+		rs_salon_notice( sprintf( 'Товаров удалённых салонов перемещено в корзину: %d.', count( $orphans ) ) );
+		// Товары салона из корзины помечаются его ID и вернутся вместе с ним;
+		// салон 0 — салона уже нет, такие товары восстанавливаются вручную.
+		foreach ( $by_salon as $salon_id => $ids ) {
+			rs_salon_dispatch( 'trash', $salon_id, $ids );
+		}
 
 		wp_safe_redirect( admin_url( 'edit.php?post_type=' . rs_salon_post_type() ) );
 		exit;
